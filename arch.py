@@ -5,6 +5,7 @@ Single file for now; splits into modules once it earns the complexity.
     python arch.py chunks  <repo>
     python arch.py bm25    <repo> <query...>
     python arch.py vec     <repo> <query...>
+    python arch.py hybrid  <repo> <query...>
 """
 from __future__ import annotations
 
@@ -277,6 +278,40 @@ class VectorIndex:
         return [(float(scores[i]), self.chunks[i]) for i in np.argsort(-scores)[:k]]
 
 
+# ------------------------------------------------------------------ fusion
+
+RRF_K = 60
+FUSE_DEPTH = 20
+
+
+def rrf(rankings: list[list[tuple[float, dict]]], k: int = RRF_K,
+        top: int = 5) -> list[tuple[float, dict]]:
+    """Reciprocal Rank Fusion.
+
+    Each list contributes 1/(k + rank) per chunk; the scores are summed.
+    Only ranks are used, never the raw scores -- BM25 returns unbounded
+    positive numbers and cosine returns -1..1, so there is no sane way to add
+    them directly. Normalising them would need a calibration set we don't have.
+    Rank position is the one thing both retrievers agree on the meaning of.
+
+    k=60 is the constant from Cormack et al. (2009). It damps the top ranks:
+    without it, rank 1 would dominate so heavily that a second opinion from
+    the other retriever could never promote anything.
+
+    Fuse deeper than you return -- rankings are taken to FUSE_DEPTH so a chunk
+    ranked 12th by both can beat one ranked 2nd by one and absent from the other.
+    """
+    scores: dict[str, float] = {}
+    chunks: dict[str, dict] = {}
+    for ranked in rankings:
+        for rank, (_, chunk) in enumerate(ranked, 1):
+            cid = chunk["chunk_id"]
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+            chunks[cid] = chunk
+    ordered = sorted(scores.items(), key=lambda kv: -kv[1])
+    return [(score, chunks[cid]) for cid, score in ordered[:top]]
+
+
 # -------------------------------------------------------------------- cli
 
 def _show(hits, fmt="{:6.2f}"):
@@ -318,6 +353,24 @@ def main(argv: list[str]) -> None:
         print(f"indexed {len(chunks)} chunks in {time.perf_counter()-t0:.2f}s "
               f"({'cached' if index.cached else 'fresh'})\nquery: {query!r}\n")
         _show(index.search(query), "{:5.3f}")
+
+    elif command == "hybrid":
+        keyword = BM25(chunks).search(query, k=FUSE_DEPTH)
+        dense = VectorIndex(chunks).search(query, k=FUSE_DEPTH)
+        print(f"indexed {len(chunks)} chunks\nquery: {query!r}\n")
+
+        print("BM25 top 5:")
+        _show(keyword[:5])
+        print("\nvector top 5:")
+        _show(dense[:5], "{:5.3f}")
+        print("\nhybrid (RRF) top 5:")
+        _show(rrf([keyword, dense]), "{:6.4f}")
+
+        fused = {c["chunk_id"] for _, c in rrf([keyword, dense])}
+        seen_alone = ({c["chunk_id"] for _, c in keyword[:5]}
+                      | {c["chunk_id"] for _, c in dense[:5]})
+        print(f"\n{len(fused - seen_alone)} of the 5 fused hits were in "
+              f"neither retriever's top 5 on its own")
 
     else:
         print(__doc__)
