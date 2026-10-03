@@ -6,7 +6,7 @@ Single file for now; splits into modules once it earns the complexity.
     python arch.py bm25    <repo> <query...>
     python arch.py vec     <repo> <query...>
     python arch.py hybrid  <repo> <query...>
-    python arch.py route   <repo> <query...>\n    python arch.py eval    <repo> <questions.json>
+    python arch.py route   <repo> <query...>\n    python arch.py ask     <repo> <query...>   (needs GEMINI_API_KEY)\n    python arch.py eval    <repo> <questions.json>
 """
 from __future__ import annotations
 
@@ -390,6 +390,65 @@ def route(query: str, bm: "BM25", vec: "VectorIndex", names: set[str],
     return (bm if is_identifier_query(query, names) else vec).search(query, k)
 
 
+# ------------------------------------------------------------------ answer
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
+              "{model}:generateContent")
+
+PROMPT = """You are answering a question about a specific codebase. Below are \
+the only code excerpts you may use. Each is headed by its file and line range.
+
+Rules:
+- Answer only from these excerpts. Do not use general knowledge about how such
+  systems are usually written.
+- Cite the file and line range for every claim, like (app/store.py:24-52).
+- If the excerpts do not contain the answer, say exactly: "Not in the retrieved
+  code." and then name which files you would look in next. Do not guess.
+- Be brief. Two or three sentences unless the question needs more.
+
+QUESTION: {question}
+
+EXCERPTS:
+{excerpts}
+"""
+
+
+def build_prompt(question: str, hits: list[tuple[float, dict]]) -> str:
+    excerpts = []
+    for _, c in hits:
+        header = f"--- {c['path']}:{c['start_line']}-{c['end_line']} ---"
+        excerpts.append(header + "\n" + c["source"])
+    return PROMPT.format(question=question, excerpts="\n\n".join(excerpts))
+
+
+def ask_gemini(prompt: str) -> str:
+    """Call Gemini over plain REST.
+
+    httpx is already a dependency and the REST contract is stable, so this
+    avoids taking on an SDK whose import path has changed twice.
+    """
+    import httpx
+
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise SystemExit("set GEMINI_API_KEY first")
+
+    resp = httpx.post(
+        GEMINI_URL.format(model=GEMINI_MODEL),
+        params={"key": key},
+        json={"contents": [{"parts": [{"text": prompt}]}]},
+        timeout=30.0,
+    )
+    if resp.status_code != 200:
+        raise SystemExit(f"gemini {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError):
+        return f"unexpected response shape: {data}"
+
+
 # -------------------------------------------------------------------- eval
 
 def load_questions(path: Path) -> list[dict]:
@@ -560,6 +619,18 @@ def main(argv: list[str]) -> None:
               f"routed to {'BM25' if kind == 'identifier' else 'vector'} "
               f"({kind} query)\n")
         _show(route(query, bm, vec, names))
+
+    elif command == "ask":
+        bm, vec = BM25(chunks), VectorIndex(chunks)
+        names = symbol_names(chunks)
+        kind = "identifier" if is_identifier_query(query, names) else "paraphrase"
+        hits = route(query, bm, vec, names, 5)
+        print(f"query: {query!r}  ({kind} -> "
+              f"{'BM25' if kind == 'identifier' else 'vector'})\n")
+        for _, c in hits:
+            print(f"  retrieved {c['path']}:{c['start_line']}-{c['end_line']}")
+        print()
+        print(ask_gemini(build_prompt(query, hits)))
 
     elif command == "eval":
         if not argv[2:]:
