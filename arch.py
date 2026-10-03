@@ -6,10 +6,12 @@ Single file for now; splits into modules once it earns the complexity.
     python arch.py bm25    <repo> <query...>
     python arch.py vec     <repo> <query...>
     python arch.py hybrid  <repo> <query...>
+    python arch.py eval    <repo> <questions.json>
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sys
@@ -312,6 +314,96 @@ def rrf(rankings: list[list[tuple[float, dict]]], k: int = RRF_K,
     return [(score, chunks[cid]) for cid, score in ordered[:top]]
 
 
+# -------------------------------------------------------------------- eval
+
+def load_questions(path: Path) -> list[dict]:
+    """Each entry: {"q": "...", "file": "app/x.py", "name": "func_name"}."""
+    return json.loads(path.read_text())
+
+
+def _rank_of(hits: list[tuple[float, dict]], want: dict) -> int | None:
+    """1-based rank of the expected chunk, or None if absent.
+
+    Matched on (path, name) rather than chunk_id -- line numbers shift every
+    time the target repo is edited, and a question set that rots on every
+    commit is a question set nobody re-runs.
+    """
+    for rank, (_, c) in enumerate(hits, 1):
+        if c["path"] == want["file"] and c["name"] == want["name"]:
+            return rank
+    return None
+
+
+def _metrics(ranks: list[int | None], at: int = 5) -> dict:
+    n = len(ranks)
+    if not n:
+        return {"r@1": 0.0, f"r@{at}": 0.0, "mrr": 0.0}
+    return {
+        "r@1": sum(1 for r in ranks if r == 1) / n,
+        f"r@{at}": sum(1 for r in ranks if r is not None and r <= at) / n,
+        "mrr": sum((1.0 / r) for r in ranks if r is not None) / n,
+    }
+
+
+def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
+    """Score BM25, vector and hybrid on the same labelled questions."""
+    index = {(c["path"], c["name"]) for c in chunks}
+    missing = [q for q in questions if (q["file"], q["name"]) not in index]
+    live = [q for q in questions if (q["file"], q["name"]) in index]
+
+    if missing:
+        print(f"{len(missing)} question(s) point at a chunk that does not exist "
+              f"-- fix these before trusting the numbers:")
+        for q in missing:
+            print(f"  {q['file']} : {q['name']}   <- {q['q']!r}")
+        print()
+    if not live:
+        raise SystemExit("no usable questions")
+
+    bm = BM25(chunks)
+    vec = VectorIndex(chunks)
+
+    runs: dict[str, list[int | None]] = {"BM25": [], "Vector": [], "Hybrid": []}
+    unanswered = []
+    for q in live:
+        keyword = bm.search(q["q"], k=FUSE_DEPTH)
+        dense = vec.search(q["q"], k=FUSE_DEPTH)
+        fused = rrf([keyword, dense], top=at)
+
+        ranks = {
+            "BM25": _rank_of(keyword[:at], q),
+            "Vector": _rank_of(dense[:at], q),
+            "Hybrid": _rank_of(fused, q),
+        }
+        for name, r in ranks.items():
+            runs[name].append(r)
+        if not any(ranks.values()):
+            unanswered.append(q)
+
+    def table(title, keep):
+        idx = [i for i, q in enumerate(live) if keep(q)]
+        if not idx:
+            return
+        print(f"{title}  (n={len(idx)})")
+        print(f"{'':10}{'R@1':>8}{f'R@{at}':>8}{'MRR':>8}")
+        for name, ranks in runs.items():
+            m = _metrics([ranks[i] for i in idx], at)
+            print(f"{name:10}{m['r@1']:8.2f}{m[f'r@{at}']:8.2f}{m['mrr']:8.2f}")
+        print()
+
+    print(f"{len(live)} questions, top-{at}\n")
+    table("ALL", lambda q: True)
+    kinds = sorted({q.get("kind", "untagged") for q in live})
+    if len(kinds) > 1:
+        for kind in kinds:
+            table(kind.upper(), lambda q, k=kind: q.get("kind", "untagged") == k)
+
+    if unanswered:
+        print(f"\n{len(unanswered)} question(s) no retriever answered in top {at}:")
+        for q in unanswered:
+            print(f"  {q['q']!r}\n      -> {q['file']} : {q['name']}")
+
+
 # -------------------------------------------------------------------- cli
 
 def _show(hits, fmt="{:6.2f}"):
@@ -371,6 +463,11 @@ def main(argv: list[str]) -> None:
                       | {c["chunk_id"] for _, c in dense[:5]})
         print(f"\n{len(fused - seen_alone)} of the 5 fused hits were in "
               f"neither retriever's top 5 on its own")
+
+    elif command == "eval":
+        if not argv[2:]:
+            raise SystemExit("usage: python arch.py eval <repo> <questions.json>")
+        evaluate(chunks, load_questions(Path(argv[2]).expanduser()))
 
     else:
         print(__doc__)
