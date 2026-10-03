@@ -30,6 +30,7 @@ PY_LANGUAGE = Language(tspython.language())
 _parser = Parser(PY_LANGUAGE)
 
 TARGETS = {"function_definition", "class_definition"}
+NEWLINE = b"\n"
 
 
 def _body(node):
@@ -108,12 +109,50 @@ def _class_stub(node, source: bytes) -> str:
     return "\n".join(lines)
 
 
+def _module_preamble(tree, source: bytes):
+    """Byte range of the top-level code before the first def/class.
+
+    Constants and the comments explaining them live here -- MIN_PCT_MOVE and
+    its three-line justification, FETCH_INTERVAL_SECONDS, the API URL. A
+    chunker that only emits functions and classes cannot retrieve any of it,
+    so "why don't stablecoins trigger alerts" is unanswerable even though the
+    answer is written in the repo. Only emitted when there is a top-level
+    assignment, so files opening with bare imports add no noise.
+    """
+    first_def = None
+    has_assignment = False
+    for child in tree.root_node.children:
+        if child.type in TARGETS or child.type == "decorated_definition":
+            first_def = child.start_byte
+            break
+        if child.type == "expression_statement" and child.children:
+            if child.children[0].type in ("assignment", "augmented_assignment"):
+                has_assignment = True
+    end = first_def if first_def is not None else len(source)
+    return (0, end) if has_assignment and end > 0 else None
+
+
 def extract_chunks(path: Path, root: Path | None = None) -> list[dict]:
     source = path.read_bytes()
     tree = _parser.parse(source)
     rel = str(path.relative_to(root)) if root else str(path)
 
     chunks = []
+    preamble = _module_preamble(tree, source)
+    if preamble:
+        start, end = preamble
+        text = source[start:end].decode(errors="replace").strip()
+        if text:
+            last_line = source[:end].count(NEWLINE) + 1
+            chunks.append({
+                "chunk_id": rel + ":1-" + str(last_line) + ":<module>",
+                "path": rel,
+                "kind": "module",
+                "name": "<module>",
+                "start_line": 1,
+                "end_line": last_line,
+                "source": text,
+            })
     for node, outer in _iter_definitions(tree.root_node):
         name_node = node.child_by_field_name("name")
         name = name_node.text.decode() if name_node else "<anonymous>"
@@ -365,8 +404,10 @@ def _rank_of(hits: list[tuple[float, dict]], want: dict) -> int | None:
     time the target repo is edited, and a question set that rots on every
     commit is a question set nobody re-runs.
     """
+    targets = {(want["file"], want["name"])}
+    targets |= {(a["file"], a["name"]) for a in want.get("alt", [])}
     for rank, (_, c) in enumerate(hits, 1):
-        if c["path"] == want["file"] and c["name"] == want["name"]:
+        if (c["path"], c["name"]) in targets:
             return rank
     return None
 
@@ -385,8 +426,14 @@ def _metrics(ranks: list[int | None], at: int = 5) -> dict:
 def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
     """Score BM25, vector and hybrid on the same labelled questions."""
     index = {(c["path"], c["name"]) for c in chunks}
-    missing = [q for q in questions if (q["file"], q["name"]) not in index]
-    live = [q for q in questions if (q["file"], q["name"]) in index]
+
+    def known(q):
+        pairs = [(q["file"], q["name"])]
+        pairs += [(a["file"], a["name"]) for a in q.get("alt", [])]
+        return all(pair in index for pair in pairs)
+
+    missing = [q for q in questions if not known(q)]
+    live = [q for q in questions if known(q)]
 
     if missing:
         print(f"{len(missing)} question(s) point at a chunk that does not exist "
