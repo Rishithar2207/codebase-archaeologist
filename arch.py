@@ -6,7 +6,8 @@ Single file for now; splits into modules once it earns the complexity.
     python arch.py bm25    <repo> <query...>
     python arch.py vec     <repo> <query...>
     python arch.py hybrid  <repo> <query...>
-    python arch.py route   <repo> <query...>\n    python arch.py ask     <repo> <query...>   (needs GEMINI_API_KEY)\n    python arch.py eval    <repo> <questions.json>
+    python arch.py route   <repo> <query...>
+    python arch.py ask     <repo> <query...>   (needs GEMINI_API_KEY)\n    python arch.py serve   <repo>\n    python arch.py eval    <repo> <questions.json>
 """
 from __future__ import annotations
 
@@ -109,15 +110,15 @@ def _class_stub(node, source: bytes) -> str:
     return "\n".join(lines)
 
 
-def _module_preamble(tree, source: bytes):
+def _module_preamble(tree, source: bytes) -> tuple[int, int] | None:
     """Byte range of the top-level code before the first def/class.
 
-    Constants and the comments explaining them live here -- MIN_PCT_MOVE and
-    its three-line justification, FETCH_INTERVAL_SECONDS, the API URL. A
-    chunker that only emits functions and classes cannot retrieve any of it,
-    so "why don't stablecoins trigger alerts" is unanswerable even though the
-    answer is written in the repo. Only emitted when there is a top-level
-    assignment, so files opening with bare imports add no noise.
+    Constants and the comments explaining them live here -- MIN_PCT_MOVE, its
+    three-line justification, FETCH_INTERVAL_SECONDS, the API URL. A chunker
+    that only emits functions and classes cannot retrieve any of it, so the
+    question "why don't stablecoins trigger alerts" is unanswerable even though
+    the answer is written in the repo. Only emitted when there is at least one
+    top-level assignment, so files that open with bare imports add no noise.
     """
     first_def = None
     has_assignment = False
@@ -368,14 +369,43 @@ def symbol_names(chunks: list[dict]) -> set[str]:
     return {c["name"].lower() for c in chunks}
 
 
-def is_identifier_query(query: str, names: set[str]) -> bool:
-    """True when the query names a symbol that exists in the repo.
+_CODE_SHAPED = re.compile(r"^[A-Za-z]+(_[A-Za-z0-9]+)+$|^[a-z]+[A-Z]|^[A-Z][a-z]+[A-Z]")
 
-    Cheap and surprisingly reliable: someone who types `store_prices` has seen
-    that token somewhere -- a stack trace, a review comment, a grep -- and
-    wants the definition. Someone asking "where do rows get written" has not.
+
+def matched_symbol(query: str, names: set[str]) -> str | None:
+    """The code-shaped word in the query that names a real symbol, if any."""
+    for word in re.split(r"[\s(),:;\[\]{}'\"`]+", query):
+        word = word.strip(".")
+        if word and _CODE_SHAPED.search(word) and word.lower() in names:
+            return word
+    return None
+
+
+def is_identifier_query(query: str, names: set[str]) -> bool:
+    """True when the query *types out* a symbol that exists in the repo.
+
+    Two conditions, and the second one was learned the hard way. The token has
+    to name a real symbol, AND it has to be written like code -- snake_case or
+    camelCase or CapWords.
+
+    Matching on "names a real symbol" alone scored 40/40 on a repo whose
+    functions are called `store_prices` and `check_asset`. Pointed at FastAPI,
+    it collapsed: that framework has methods named `get`, `post`, `put`,
+    `head`, `options` and `trace`, so "what happens when a request fails" was
+    classified as an identifier query and sent to BM25. The heuristic had
+    silently assumed symbol names are not ordinary English words.
+
+    Requiring code shape costs nothing on the original corpus -- every
+    identifier question there is written `fetch_prices` or `PriceReading` --
+    and removes the whole class of collision.
     """
-    return any(t in names for t in tokenize(query))
+    for word in re.split(r"[\s(),:;\[\]{}'\"`]+", query):
+        word = word.strip(".")
+        if not word or not _CODE_SHAPED.search(word):
+            continue
+        if word.lower() in names:
+            return True
+    return False
 
 
 def route(query: str, bm: "BM25", vec: "VectorIndex", names: set[str],
@@ -551,6 +581,174 @@ def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
             print(f"  {q['q']!r}\n      -> {q['file']} : {q['name']}")
 
 
+# --------------------------------------------------------------------- api
+
+def create_app(repo: Path):
+    """FastAPI wrapper. Index is built once at startup, not per request.
+
+    Chunking and embedding a repo takes seconds; doing it per request would
+    make the API useless. The index is immutable for the process lifetime --
+    re-index by restarting, which is honest for a tool pointed at a checkout.
+    """
+    from fastapi import FastAPI, HTTPException, Query
+    from pydantic import BaseModel, Field
+
+    class Health(BaseModel):
+        status: str = Field(examples=["ok"])
+        repo: str
+        chunks: int = Field(examples=[45])
+        sample_symbols: list[str] = Field(
+            description="Real symbol names from this index, so a UI can offer "
+                        "identifier-query examples that actually resolve.")
+
+    class Hit(BaseModel):
+        path: str = Field(examples=["app/anomaly.py"])
+        start_line: int = Field(examples=[34])
+        end_line: int = Field(examples=[85])
+        name: str = Field(examples=["check_asset"])
+        kind: str = Field(examples=["function"], description="function, class or module")
+        score: float = Field(examples=[11.56])
+        source: str
+
+    class SearchResponse(BaseModel):
+        query: str
+        query_kind: str = Field(description="identifier or paraphrase")
+        retriever: str = Field(description="which retriever the router chose")
+        took_ms: float = Field(examples=[3.4], description="retrieval only")
+        results: list[Hit]
+
+    class Citation(BaseModel):
+        path: str = Field(examples=["app/anomaly.py"])
+        start_line: int = Field(examples=[34])
+        end_line: int = Field(examples=[85])
+        name: str = Field(examples=["check_asset"])
+
+    class AskResponse(BaseModel):
+        query: str
+        query_kind: str
+        answer: str = Field(
+            description='Grounded in the cited chunks, or "Not in the retrieved '
+                        'code." when they do not contain the answer.')
+        citations: list[Citation]
+
+    chunks = chunk_repo(repo)
+    bm = BM25(chunks)
+    vec = VectorIndex(chunks)
+    names = symbol_names(chunks)
+
+    app = FastAPI(
+        title="Codebase Archaeologist",
+        version="0.1.0",
+        description=(
+            "Ask a Python repository questions in English and get answers "
+            "cited to file and line.\n\n"
+            "Queries are **routed**, not fused: a query naming a real symbol "
+            "goes to BM25, anything else to the embedding index. Measured on "
+            "41 labelled questions, routing scores MRR 0.54 against 0.36 for "
+            "Reciprocal Rank Fusion and 0.49 for the best single retriever."
+        ),
+    )
+
+    def _serialise(hits):
+        return [
+            {
+                "path": c["path"],
+                "start_line": c["start_line"],
+                "end_line": c["end_line"],
+                "name": c["name"],
+                "kind": c["kind"],
+                "score": round(score, 4),
+                "source": c["source"],
+            }
+            for score, c in hits
+        ]
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        from fastapi.responses import FileResponse, PlainTextResponse
+
+        page = Path(__file__).resolve().parent / "ui.html"
+        if not page.exists():
+            return PlainTextResponse("ui.html not found; API docs at /docs", 404)
+        return FileResponse(page)
+
+    class Classification(BaseModel):
+        query: str
+        query_kind: str = Field(description="identifier or paraphrase")
+        retriever: str
+        matched: str | None = Field(
+            description="the code-shaped token that named a real symbol")
+
+    @app.get("/classify", response_model=Classification,
+             summary="Which retriever would handle this query (no retrieval)")
+    def classify(q: str = Query("", max_length=500)):
+        hit = matched_symbol(q, names)
+        return {
+            "query": q,
+            "query_kind": "identifier" if hit else "paraphrase",
+            "retriever": "bm25" if hit else "vector",
+            "matched": hit,
+        }
+
+    @app.get("/health", response_model=Health,
+             summary="Index status and chunk count")
+    def health():
+        interesting = sorted(
+            (c for c in chunks
+             if c["kind"] == "function" and not c["name"].startswith("_")
+             and len(c["name"]) > 6),
+            key=lambda c: -len(c["source"]),
+        )
+        seen, samples = set(), []
+        for c in interesting:
+            if c["name"] not in seen:
+                seen.add(c["name"])
+                samples.append(c["name"])
+            if len(samples) == 3:
+                break
+        return {
+            "status": "ok",
+            "repo": str(repo),
+            "chunks": len(chunks),
+            "sample_symbols": samples,
+        }
+
+    @app.get("/search", response_model=SearchResponse,
+             summary="Retrieve chunks, routed by query type")
+    def search(q: str = Query(..., min_length=1), k: int = Query(5, ge=1, le=20)):
+        kind = "identifier" if is_identifier_query(q, names) else "paraphrase"
+        t0 = time.perf_counter()
+        hits = route(q, bm, vec, names, k)
+        took = (time.perf_counter() - t0) * 1000
+        return {
+            "query": q,
+            "query_kind": kind,
+            "retriever": "bm25" if kind == "identifier" else "vector",
+            "took_ms": round(took, 2),
+            "results": _serialise(hits),
+        }
+
+    @app.get("/ask", response_model=AskResponse,
+             summary="Answer a question with citations")
+    def ask(q: str = Query(..., min_length=1), k: int = Query(5, ge=1, le=10)):
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise HTTPException(503, "GEMINI_API_KEY is not set on the server")
+        hits = route(q, bm, vec, names, k)
+        kind = "identifier" if is_identifier_query(q, names) else "paraphrase"
+        return {
+            "query": q,
+            "query_kind": kind,
+            "answer": ask_gemini(build_prompt(q, hits)),
+            "citations": [
+                {"path": c["path"], "start_line": c["start_line"],
+                 "end_line": c["end_line"], "name": c["name"]}
+                for _, c in hits
+            ],
+        }
+
+    return app
+
+
 # -------------------------------------------------------------------- cli
 
 def _show(hits, fmt="{:6.2f}"):
@@ -631,6 +829,14 @@ def main(argv: list[str]) -> None:
             print(f"  retrieved {c['path']}:{c['start_line']}-{c['end_line']}")
         print()
         print(ask_gemini(build_prompt(query, hits)))
+
+    elif command == "serve":
+        import uvicorn
+
+        port = int(os.environ.get("PORT", "8000"))
+        print(f"indexed {len(chunks)} chunks from {root}")
+        print(f"http://127.0.0.1:{port}/docs")
+        uvicorn.run(create_app(root), host="127.0.0.1", port=port)
 
     elif command == "eval":
         if not argv[2:]:
