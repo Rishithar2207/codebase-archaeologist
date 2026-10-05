@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Deliberately NOT `pip install -r requirements.txt`.
+      #
+      # The suite runs with no network and no embedding model, so CI installs
+      # only what the tests actually exercise. That keeps a run under a minute
+      # instead of pulling ~2GB of torch for code it never executes.
+      #
+      # It also enforces a design decision: sentence-transformers, fastapi and
+      # httpx are imported lazily, inside the functions that need them, so that
+      # `arch.py chunks` and `arch.py bm25` start instantly. If someone moves
+      # one of those to the top of the file, this job fails on ImportError --
+      # which is exactly when you want to hear about it.
+      - name: Install the dependencies the tests actually use
+        run: pip install pytest numpy tree-sitter==0.26.0 tree-sitter-python==0.25.0
+
+      - name: Run tests
+        run: python -m pytest -q

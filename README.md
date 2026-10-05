@@ -1,5 +1,7 @@
 # Codebase Archaeologist
 
+[![tests](https://github.com/Rishithar2207/codebase-archaeologist/actions/workflows/tests.yml/badge.svg)](https://github.com/Rishithar2207/codebase-archaeologist/actions/workflows/tests.yml)
+
 Ask a Python repository questions in English. Get answers cited to file and line —
 or an honest "not in the retrieved code."
 
@@ -310,7 +312,16 @@ ones that motivated it.
 pytest -q
 ```
 
-34 tests, no network and no model. They cover the parts that can be wrong in ways a
+Run on every push against Python 3.11 and 3.12. CI installs `pytest`, `numpy` and the
+two tree-sitter packages — deliberately not `requirements.txt`. The suite touches no
+network and no embedding model, so a run finishes in under a minute instead of pulling
+two gigabytes of torch for code it never executes. It also pins a design decision in
+place: `sentence-transformers`, `fastapi` and `httpx` are imported lazily inside the
+functions that need them, so `arch.py chunks` starts instantly. Move one of those
+imports to the top of the file and CI fails on `ImportError`, which is when you want
+to find out.
+
+36 tests, no network and no model. They cover the parts that can be wrong in ways a
 human wouldn't notice: tokenisation, chunk boundaries, fusion arithmetic, metric
 definitions, routing, and the evaluation harness itself. The embedding model is a
 dependency, not this project's code — what's tested is how its output is combined.
