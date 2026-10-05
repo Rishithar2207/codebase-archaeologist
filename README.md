@@ -32,18 +32,18 @@ Evaluated on **41 labelled questions** against a 14-file Python service:
 | | R@1 | R@5 | MRR |
 |---|---|---|---|
 | BM25 | 0.24 | 0.39 | 0.30 |
-| Vector (MiniLM) | 0.34 | 0.71 | 0.49 |
-| Hybrid (RRF) | 0.27 | 0.56 | 0.36 |
-| **Routed** | **0.41** | **0.73** | **0.54** |
+| Vector (MiniLM) | 0.37 | 0.71 | 0.50 |
+| Hybrid (RRF) | 0.27 | 0.59 | 0.37 |
+| **Routed** | **0.44** | **0.73** | **0.55** |
 
-**Routing beats fusion by 50% on MRR, and beats the better single retriever by 10%.**
+**Routing beats fusion by 49% on MRR, and beats the better single retriever by 10%.**
 
 Split by query type, the reason is obvious:
 
 | | BM25 MRR | Vector MRR | Hybrid MRR | Routed MRR |
 |---|---|---|---|---|
-| Identifier queries (n=10) | **1.00** | 0.80 | 0.90 | **1.00** |
-| Paraphrase queries (n=31) | 0.07 | **0.39** | 0.19 | **0.39** |
+| Identifier queries (n=10) | **1.00** | 0.78 | 0.90 | **1.00** |
+| Paraphrase queries (n=31) | 0.07 | **0.41** | 0.20 | **0.41** |
 
 Each retriever is excellent at one kind of question and poor at the other. Unweighted
 Reciprocal Rank Fusion gives them equal votes, so on every query the weaker one is
@@ -181,9 +181,11 @@ so it is instructed to answer `"Not in the retrieved code."` rather than guess.
 which drops `@app.get("/prices/latest")` — the single most searchable line in a route
 handler. Traversal yields `(definition, outer)` pairs and slices from `outer`.
 
-**Classes are indexed as stubs**, not bodies: signature, docstring, and
-`# methods: a, b, c`. Methods are already chunked individually, so emitting the full
-class body would index the same source twice and let one large class dominate results.
+**Classes are indexed as stubs**, not bodies: signature, docstring, `# fields: a, b, c`
+and `# methods: x, y, z`. Methods are already chunked individually, so emitting the
+full class body would index the same source twice and let one large class dominate
+results. Fields are summarised rather than pasted for a reason that had to be measured
+-- see finding 7.
 
 **Module-level code is chunked too.** Constants and the comments explaining them live
 outside any function. `MIN_PCT_MOVE = 2.0` and its three-line justification were
@@ -210,8 +212,8 @@ stable, which avoids taking on an SDK whose import path has changed repeatedly.
 
 ## What the measurements taught
 
-**1. Fusion can be worse than its inputs.** With BM25 at 0.11 MRR on paraphrase
-queries and the vector index at 0.40, RRF produced 0.21. The arithmetic: BM25's rank-1
+**1. Fusion can be worse than its inputs.** With BM25 at 0.07 MRR on paraphrase
+queries and the vector index at 0.41, RRF produced 0.20. The arithmetic: BM25's rank-1
 chunk scores 1/61 = 0.01639, the vector index's rank-2 chunk scores 1/62 = 0.01613. A
 wrong answer the weak retriever ranked first outranks the right answer the strong one
 ranked second.
@@ -240,7 +242,7 @@ Pointed at FastAPI it collapsed — that framework defines methods named `get`, 
 symbol and was routed to BM25. The heuristic had silently assumed function names are
 not ordinary English words. Fix: require the matched token to be written like code.
 Re-running the original evaluation confirmed no regression — still 1.00 on identifier
-queries, still 0.54 overall — so the fix is a strict improvement rather than a trade.
+queries, still 0.55 overall — so the fix is a strict improvement rather than a trade.
 This is the clearest argument in the project for keeping an eval harness around: the
 bug was invisible on the corpus the heuristic was designed against.
 
@@ -251,6 +253,33 @@ the constants, and answers "z-score >= 3.0 and move >= 2.0%" with real values in
 of naming constants whose values it cannot see. The metric measured whether the
 expected chunk was retrieved. It never measured whether the answer was good.
 
+**7. Two wrong fixes taught more than the right one.** The evaluation view lists every
+question no retriever answered. Reading it, three of ten were model classes —
+`PriceReading`, `Asset`, `AnomalyOut` — and the chunker indexes classes as stubs. A
+class with no methods therefore reduced to `class PriceReading(Base):` and a docstring,
+with the field declarations discarded and indexed nowhere else. "What is stored for a
+single observation" was asking for exactly what had been deleted.
+
+The obvious fix was to emit such classes whole. Measured, it did not work: overall MRR
+did not move, R@1 rose while R@5 fell, and a question that *had* been answered —
+"what gets recorded when something unusual happens" → `models.Anomaly` — stopped being
+answered. Adding the real content made the chunk harder to find. An embedding is a mean
+over tokens, so a two-line stub carrying a descriptive docstring is nearly pure signal,
+and ten lines of `Column(Float, nullable=False)` pull the vector toward generic ORM
+boilerplate.
+
+Summarising the fields the way methods were already summarised — `# fields: symbol,
+price, ts` — is what worked: **MRR 0.54 → 0.55, R@1 0.41 → 0.44, unanswered 10 → 9**,
+with R@5 unchanged. Worth noting that the stated reason was still half wrong: the gain
+is entirely in the embedding index, and BM25's paraphrase scores did not move at all,
+though adding searchable tokens was the justification given.
+
+Three things follow. Chunking decisions that are right for one kind of class can be
+wrong for another, and only a per-question eval surfaces which. More text in a chunk
+can lower its recall. And a correct prediction is not the same as a correct
+explanation — the second experiment succeeded for reasons partly different from the
+ones that motivated it.
+
 ---
 
 ## Limitations
@@ -258,8 +287,8 @@ expected chunk was retrieved. It never measured whether the answer was good.
 - 41 questions, 10 of them identifier-style. Small. "10/10", not "100%".
 - Two repositories, one language: a 45-chunk service and 557 chunks of FastAPI's
   source. Nothing here is validated at real scale.
-- Roughly 10 paraphrase questions are unanswered by every retriever. The ceiling is in
-  what gets indexed, not how it's ranked.
+- Nine paraphrase questions are unanswered by every retriever. The ceiling is in what
+  gets indexed, not how it's ranked.
 - Untested ideas for that ceiling: a code-trained embedding model; one chunk per
   top-level constant carrying its own comment block; an LLM-written summary indexed
   alongside each chunk's source.

@@ -92,11 +92,50 @@ def _method_names(node) -> list[str]:
     return names
 
 
+def _field_names(node) -> list[str]:
+    """Names assigned or annotated directly in a class body.
+
+    `symbol = Column(String)` and `symbol: str` both count; anything inside a
+    method does not, because this walks only the class body's direct children.
+    Dunders are skipped -- `__tablename__` is framework plumbing, and nobody
+    asks a question whose answer is its presence.
+    """
+    body = _body(node)
+    if body is None:
+        return []
+    names = []
+    for child in body.children:
+        stmt = child.children[0] if child.type == "expression_statement" else child
+        if stmt is None or stmt.type not in ("assignment", "augmented_assignment"):
+            continue
+        target = stmt.child_by_field_name("left")
+        if target is not None and target.type == "identifier":
+            name = target.text.decode()
+            if not (name.startswith("__") and name.endswith("__")):
+                names.append(name)
+    return names
+
+
 def _class_stub(node, source: bytes) -> str:
-    """Signature + docstring + method names.
+    """Signature, docstring, and the *names* of what the class contains.
 
     Methods are chunked individually, so emitting the full class body as well
     would index the same source twice and let one big class dominate retrieval.
+    Fields are listed the same way methods are, for a reason measured rather
+    than assumed.
+
+    The first attempt at fixing model classes emitted their bodies in full, on
+    the theory that an ORM model is nothing but its fields and stubbing deleted
+    its only content. Measured, that was wrong in an instructive way: overall
+    MRR did not move (0.54 either way), R@1 rose and R@5 fell, and one question
+    that had been answered -- "what gets recorded when something unusual
+    happens" -> models.Anomaly -- stopped being answered at all. An embedding is
+    a mean over tokens, so a two-line stub carrying a docstring is nearly pure
+    signal, and ten lines of `Column(Float, nullable=False)` dilute it toward
+    generic ORM boilerplate. More text made the chunk *less* like the question.
+
+    Listing field names is the version that gives BM25 the tokens it needs
+    without burying the docstring the embedding depends on.
     """
     body = _body(node)
     end = body.start_byte if body is not None else node.end_byte
@@ -104,6 +143,9 @@ def _class_stub(node, source: bytes) -> str:
     doc = _docstring(node, source)
     if doc:
         lines.append("    " + doc)
+    fields = _field_names(node)
+    if fields:
+        lines.append("    # fields: " + ", ".join(fields))
     methods = _method_names(node)
     if methods:
         lines.append("    # methods: " + ", ".join(methods))

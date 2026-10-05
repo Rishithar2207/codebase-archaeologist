@@ -37,6 +37,13 @@ class PriceRepository:
         return symbol
 
 
+class AnomalyOut(BaseModel):
+    """What a flagged event looks like on the wire."""
+
+    symbol: str
+    z_score: float
+
+
 @app.get("/prices/latest")
 def get_latest_prices(repo):
     """Latest price for each asset."""
@@ -97,6 +104,21 @@ def test_class_chunk_is_a_stub_not_the_whole_body(chunks):
     assert c["kind"] == "class"
     assert "# methods: __init__, latest" in c["source"]
     assert "self.session = session" not in c["source"]
+
+
+def test_field_names_are_listed_the_way_method_names_are(chunks):
+    # A model class is nothing but its fields, and the stub used to drop them.
+    # Listing the names rather than pasting the declarations is deliberate --
+    # see the docstring on _class_stub for the measurement behind it.
+    c = by_name(chunks, "AnomalyOut")
+    assert "# fields: symbol, z_score" in c["source"]
+    assert "float" not in c["source"]
+
+
+def test_a_field_inside_a_method_is_not_listed_as_a_class_field(chunks):
+    c = by_name(chunks, "PriceRepository")
+    assert "# fields:" not in c["source"]      # only self.session, inside __init__
+    assert "# methods: __init__, latest" in c["source"]
 
 
 def test_methods_are_chunked_individually(chunks):
