@@ -351,7 +351,11 @@ class BM25:
 
 # ------------------------------------------------------------- embeddings
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+# Swappable so the choice of embedding model can be measured rather than argued
+# about:  ARCH_MODEL=<name> python arch.py eval <repo> questions.json
+# The cache key below includes this name, so switching models writes a separate
+# cache rather than silently reusing the previous model's vectors.
+MODEL_NAME = os.environ.get("ARCH_MODEL", "all-MiniLM-L6-v2")
 CACHE_DIR = Path(".cache")
 
 _model = None
@@ -362,7 +366,14 @@ def _load_model():
     if _model is None:
         from sentence_transformers import SentenceTransformer
 
-        _model = SentenceTransformer(MODEL_NAME)
+        kwargs = {}
+        if os.environ.get("ARCH_MODEL_TRUST") == "1":
+            # Some code-trained models (jina-embeddings-v2-base-code among them)
+            # ship their own architecture and will not load without this. It
+            # executes code downloaded from the Hub, so it is opt-in per run
+            # rather than a default, and the default model does not need it.
+            kwargs["trust_remote_code"] = True
+        _model = SentenceTransformer(MODEL_NAME, **kwargs)
     return _model
 
 
@@ -671,7 +682,7 @@ def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
         print()
 
     print(f"{len(report['rows'])} questions, top-{at}, "
-          f"NAME_BOOST={report['name_boost']}\n")
+          f"NAME_BOOST={report['name_boost']}, model={MODEL_NAME}\n")
     for title, g in report["groups"].items():
         if not g:
             continue

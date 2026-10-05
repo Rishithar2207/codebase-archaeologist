@@ -55,6 +55,11 @@ Reproduce it:
 
 ```bash
 python arch.py eval ~/code/your-repo questions.json
+
+# or against a different embedding model -- the cache key includes the model
+# name, so this re-embeds rather than reusing the previous model's vectors
+ARCH_MODEL=flax-sentence-embeddings/st-codesearch-distilroberta-base \
+  python arch.py eval ~/code/your-repo questions.json
 ```
 
 ---
@@ -282,6 +287,41 @@ can lower its recall. And a correct prediction is not the same as a correct
 explanation — the second experiment succeeded for reasons partly different from the
 ones that motivated it.
 
+**8. The code-trained embedding model was worse, and the shape of the loss is the
+useful part.** Nine questions are answered by nothing, so the obvious move is a model
+trained on code instead of English prose. `MODEL_NAME` reads from `ARCH_MODEL`, which
+makes that a one-command experiment, and the cache key includes the model name so the
+comparison cannot accidentally reuse the previous model's vectors.
+
+Against `flax-sentence-embeddings/st-codesearch-distilroberta-base`, trained on
+CodeSearchNet's docstring/code pairs:
+
+| | MiniLM (general) | CodeSearch-distilroberta |
+|---|---|---|
+| Identifier queries — vector MRR | 0.78 | **1.00** |
+| Paraphrase queries — vector MRR | **0.41** | 0.30 |
+| Paraphrase queries — vector R@5 | **0.65** | 0.45 |
+| All queries — routed MRR | **0.55** | 0.47 |
+| Answered by no retriever | **9** | 16 |
+
+It became *perfect* on identifier queries and distinctly worse on paraphrase. Those
+gains land exactly where BM25 already scores 1.00 in 2.3ms with nothing to download,
+and the losses land exactly where nothing else works. 330MB of weights for a strictly
+worse system.
+
+The explanation is the training objective. CodeSearchNet teaches code-token similarity,
+which is why identifiers became perfect — the model learned to do what BM25 does.
+MiniLM is a general sentence encoder trained on over a billion English pairs, and
+fine-tuning a distilroberta onto code costs you that English. "How many times does it
+try again before giving up" is an English sentence, and the code model is worse at
+English than the general model it replaced.
+
+So the ceiling is not the encoder. Nine questions point at code whose *behaviour* is
+not stated in its own text — retry counts live in a decorator's arguments, scheduling
+intervals in a constant three files away. No embedding of the function body contains
+that answer, because the answer is not in the function body. That is an indexing
+problem, and the untested ideas in the limitations below are aimed at it.
+
 ---
 
 ## Limitations
@@ -291,9 +331,10 @@ ones that motivated it.
   source. Nothing here is validated at real scale.
 - Nine paraphrase questions are unanswered by every retriever. The ceiling is in what
   gets indexed, not how it's ranked.
-- Untested ideas for that ceiling: a code-trained embedding model; one chunk per
-  top-level constant carrying its own comment block; an LLM-written summary indexed
-  alongside each chunk's source.
+- A code-trained embedding model was the obvious idea for that ceiling. It was tried
+  and it lost — see finding 8. Still untested: one chunk per top-level constant
+  carrying its own comment block, and an LLM-written summary indexed alongside each
+  chunk's source.
 - Python only. tree-sitter has grammars for everything else; the chunker doesn't use
   them yet.
 - The index is built at startup and never invalidated — re-index by restarting.

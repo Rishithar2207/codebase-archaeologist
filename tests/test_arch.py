@@ -223,6 +223,31 @@ def test_explain_of_a_chunk_with_no_matching_term_is_empty(chunks):
     assert bm.explain("zzzzz nothing here", i)["terms"] == []
 
 
+# ------------------------------------------------------------- embed cache
+
+def test_the_embedding_cache_key_depends_on_the_model(chunks):
+    # Switching models must not silently reuse the previous model's vectors.
+    # Without the model name in the key, `ARCH_MODEL=... arch.py eval` would
+    # load a stale .npy and report the old model's numbers under a new name --
+    # a wrong measurement that looks completely plausible.
+    original = arch.MODEL_NAME
+    try:
+        arch.MODEL_NAME = "model-a"
+        a = arch._fingerprint(chunks)
+        arch.MODEL_NAME = "model-b"
+        b = arch._fingerprint(chunks)
+    finally:
+        arch.MODEL_NAME = original
+    assert a != b
+
+
+def test_the_embedding_cache_key_depends_on_the_chunks(chunks):
+    before = arch._fingerprint(chunks)
+    altered = [dict(c) for c in chunks]
+    altered[0]["source"] = altered[0]["source"] + "\n# one more line\n"
+    assert arch._fingerprint(altered) != before
+
+
 # ------------------------------------------------------------------ fusion
 
 def _fake(names):
