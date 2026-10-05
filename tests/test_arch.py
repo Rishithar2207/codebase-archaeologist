@@ -174,6 +174,33 @@ def test_name_boost_does_not_fire_on_an_unrelated_query(chunks):
     assert boosted == plain
 
 
+def test_explain_sums_to_the_score_it_claims_to_explain(chunks):
+    # explain() is a second implementation of the BM25 formula, kept out of the
+    # hot loop on purpose. This test is the only thing stopping the two drifting
+    # apart, so it is the most important test in the file.
+    bm = arch.BM25(chunks)
+    for query in ["validate_token", "latest price for each asset", "session symbol"]:
+        toks = arch.tokenize(query)
+        for i in range(len(chunks)):
+            e = bm.explain(query, i)
+            itemised = sum(t["contribution"] for t in e["terms"])
+            itemised *= e["name_boost"] or 1.0
+            assert itemised == pytest.approx(bm.score(toks, i), abs=1e-3)
+
+
+def test_explain_reports_the_boost_only_when_it_fired(chunks):
+    bm = arch.BM25(chunks)
+    i = next(i for i, c in enumerate(chunks) if c["name"] == "validate_token")
+    assert bm.explain("validate_token", i)["name_boost"] == arch.NAME_BOOST
+    assert bm.explain("latest price", i)["name_boost"] is None
+
+
+def test_explain_of_a_chunk_with_no_matching_term_is_empty(chunks):
+    bm = arch.BM25(chunks)
+    i = next(i for i, c in enumerate(chunks) if c["name"] == "validate_token")
+    assert bm.explain("zzzzz nothing here", i)["terms"] == []
+
+
 # ------------------------------------------------------------------ fusion
 
 def _fake(names):
@@ -247,6 +274,49 @@ def test_metrics_are_computed_over_all_questions_including_misses():
 
 def test_metrics_of_an_empty_run_are_zero_not_an_error():
     assert arch._metrics([], at=5)["mrr"] == 0.0
+
+
+# ---------------------------------------------------------------- eval run
+
+class _StubVector:
+    """Stands in for the embedding index so the eval can be tested offline."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def search(self, query, k=5):
+        return [(0.5, c) for c in self.chunks[:k]]
+
+
+def test_run_eval_keeps_per_question_ranks_next_to_the_aggregate(chunks):
+    questions = [
+        {"q": "where is validate_token", "file": "app/sample.py",
+         "name": "validate_token", "kind": "identifier"},
+        {"q": "how are prices read", "file": "app/sample.py",
+         "name": "latest", "kind": "paraphrase"},
+    ]
+    report = arch.run_eval(chunks, questions, bm=arch.BM25(chunks),
+                           vec=_StubVector(chunks))
+
+    assert len(report["rows"]) == 2
+    assert set(report["rows"][0]["ranks"]) == set(arch.RETRIEVERS)
+    assert report["groups"]["ALL"]["n"] == 2
+    assert report["groups"]["IDENTIFIER"]["n"] == 1
+    # the aggregate must be derivable from the rows it ships with
+    mrr = report["groups"]["IDENTIFIER"]["metrics"]["BM25"]["mrr"]
+    rank = report["rows"][0]["ranks"]["BM25"]
+    assert mrr == pytest.approx(1 / rank if rank else 0.0)
+
+
+def test_run_eval_flags_a_question_pointing_at_a_chunk_that_is_gone(chunks):
+    questions = [
+        {"q": "fine", "file": "app/sample.py", "name": "validate_token"},
+        {"q": "stale", "file": "app/sample.py", "name": "deleted_function"},
+    ]
+    report = arch.run_eval(chunks, questions, bm=arch.BM25(chunks),
+                           vec=_StubVector(chunks))
+    assert len(report["rows"]) == 1
+    assert report["missing"][0]["expected"] == "app/sample.py:deleted_function"
 
 
 # ------------------------------------------------------------------ prompt

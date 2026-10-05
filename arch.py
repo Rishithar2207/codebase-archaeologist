@@ -273,6 +273,39 @@ class BM25:
         hits.sort(key=lambda pair: -pair[0])
         return hits[:k]
 
+    def explain(self, query: str, i: int) -> dict:
+        """Itemise score() for one chunk: what each query term contributed.
+
+        Deliberately a second implementation rather than a refactor of
+        score(). score() runs once per chunk per query -- building a dict of
+        per-term contributions in that loop costs more than the retrieval it
+        is explaining, and the measured 2-3ms is a claim this project makes.
+        The duplication is held honest by a test asserting the two agree, which
+        is cheaper than the alternative and fails loudly if either drifts.
+        """
+        tokens = tokenize(query)
+        freq, length = self.freqs[i], self.lengths[i]
+        norm_len = 1 - self.b + self.b * length / (self.avgdl or 1)
+
+        agg: dict[str, dict] = {}
+        for term in tokens:
+            tf = freq.get(term, 0)
+            if not tf:
+                continue
+            idf = self.idf.get(term, 0.0)
+            e = agg.setdefault(term, {"term": term, "tf": tf, "idf": idf,
+                                      "contribution": 0.0})
+            e["contribution"] += idf * tf * (self.k1 + 1) / (tf + self.k1 * norm_len)
+
+        terms = sorted(agg.values(), key=lambda e: -e["contribution"])
+        boosted = bool(terms) and self.chunks[i]["name"].lower() in tokens
+        return {
+            "terms": [{"term": e["term"], "tf": e["tf"],
+                       "idf": round(e["idf"], 3),
+                       "contribution": round(e["contribution"], 4)} for e in terms],
+            "name_boost": NAME_BOOST if boosted else None,
+        }
+
 
 # ------------------------------------------------------------- embeddings
 
@@ -512,8 +545,19 @@ def _metrics(ranks: list[int | None], at: int = 5) -> dict:
     }
 
 
-def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
-    """Score BM25, vector and hybrid on the same labelled questions."""
+RETRIEVERS = ("BM25", "Vector", "Hybrid", "Routed")
+
+
+def run_eval(chunks: list[dict], questions: list[dict], at: int = 5,
+             bm: "BM25 | None" = None, vec: "VectorIndex | None" = None) -> dict:
+    """Score every retriever on every labelled question and return the lot.
+
+    One implementation behind both the CLI table and the /eval endpoint. The
+    per-question ranks are kept, not just the aggregates, because the aggregate
+    is the claim and the per-question rows are the evidence for it -- and a
+    reader who cannot see which questions were missed has to take 0.54 on
+    faith.
+    """
     index = {(c["path"], c["name"]) for c in chunks}
 
     def known(q):
@@ -523,72 +567,97 @@ def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
 
     missing = [q for q in questions if not known(q)]
     live = [q for q in questions if known(q)]
-
-    if missing:
-        print(f"{len(missing)} question(s) point at a chunk that does not exist "
-              f"-- fix these before trusting the numbers:")
-        for q in missing:
-            print(f"  {q['file']} : {q['name']}   <- {q['q']!r}")
-        print()
     if not live:
         raise SystemExit("no usable questions")
 
-    bm = BM25(chunks)
-    vec = VectorIndex(chunks)
-
+    bm = bm or BM25(chunks)
+    vec = vec or VectorIndex(chunks)
     names = symbol_names(chunks)
-    runs: dict[str, list[int | None]] = {
-        "BM25": [], "Vector": [], "Hybrid": [], "Routed": [],
-    }
-    unanswered = []
+
+    rows = []
     for q in live:
         keyword = bm.search(q["q"], k=FUSE_DEPTH)
         dense = vec.search(q["q"], k=FUSE_DEPTH)
         fused = rrf([keyword, dense], top=at)
-
         ranks = {
             "BM25": _rank_of(keyword[:at], q),
             "Vector": _rank_of(dense[:at], q),
             "Hybrid": _rank_of(fused, q),
             "Routed": _rank_of(route(q["q"], bm, vec, names, at), q),
         }
-        for name, r in ranks.items():
-            runs[name].append(r)
-        if not any(ranks.values()):
-            unanswered.append(q)
+        rows.append({
+            "q": q["q"],
+            "kind": q.get("kind", "untagged"),
+            "expected": f"{q['file']}:{q['name']}",
+            "ranks": ranks,
+            "answered": any(r is not None for r in ranks.values()),
+        })
 
-    def table(title, keep):
-        idx = [i for i, q in enumerate(live) if keep(q)]
-        if not idx:
-            return
-        print(f"{title}  (n={len(idx)})")
+    def group(keep):
+        picked = [r for r in rows if keep(r)]
+        if not picked:
+            return None
+        return {
+            "n": len(picked),
+            "metrics": {name: _metrics([r["ranks"][name] for r in picked], at)
+                        for name in RETRIEVERS},
+        }
+
+    kinds = sorted({r["kind"] for r in rows})
+    if len(kinds) < 2:
+        kinds = []
+    return {
+        "at": at,
+        "name_boost": NAME_BOOST,
+        "rows": rows,
+        "groups": {"ALL": group(lambda r: True),
+                   **{k.upper(): group(lambda r, k=k: r["kind"] == k) for k in kinds}},
+        "missing": [{"q": q["q"], "expected": f"{q['file']}:{q['name']}"}
+                    for q in missing],
+    }
+
+
+def evaluate(chunks: list[dict], questions: list[dict], at: int = 5) -> None:
+    """Score BM25, vector and hybrid on the same labelled questions."""
+    report = run_eval(chunks, questions, at)
+
+    if report["missing"]:
+        print(f"{len(report['missing'])} question(s) point at a chunk that does "
+              f"not exist -- fix these before trusting the numbers:")
+        for m in report["missing"]:
+            print(f"  {m['expected']}   <- {m['q']!r}")
+        print()
+
+    print(f"{len(report['rows'])} questions, top-{at}, "
+          f"NAME_BOOST={report['name_boost']}\n")
+    for title, g in report["groups"].items():
+        if not g:
+            continue
+        print(f"{title}  (n={g['n']})")
         print(f"{'':10}{'R@1':>8}{f'R@{at}':>8}{'MRR':>8}")
-        for name, ranks in runs.items():
-            m = _metrics([ranks[i] for i in idx], at)
+        for name in RETRIEVERS:
+            m = g["metrics"][name]
             print(f"{name:10}{m['r@1']:8.2f}{m[f'r@{at}']:8.2f}{m['mrr']:8.2f}")
         print()
 
-    print(f"{len(live)} questions, top-{at}, NAME_BOOST={NAME_BOOST}\n")
-    table("ALL", lambda q: True)
-    kinds = sorted({q.get("kind", "untagged") for q in live})
-    if len(kinds) > 1:
-        for kind in kinds:
-            table(kind.upper(), lambda q, k=kind: q.get("kind", "untagged") == k)
-
+    unanswered = [r for r in report["rows"] if not r["answered"]]
     if unanswered:
         print(f"\n{len(unanswered)} question(s) no retriever answered in top {at}:")
-        for q in unanswered:
-            print(f"  {q['q']!r}\n      -> {q['file']} : {q['name']}")
+        for r in unanswered:
+            print(f"  {r['q']!r}\n      -> {r['expected']}")
 
 
 # --------------------------------------------------------------------- api
 
-def create_app(repo: Path):
+def create_app(repo: Path, questions: list[dict] | None = None):
     """FastAPI wrapper. Index is built once at startup, not per request.
 
     Chunking and embedding a repo takes seconds; doing it per request would
     make the API useless. The index is immutable for the process lifetime --
     re-index by restarting, which is honest for a tool pointed at a checkout.
+
+    `questions` is optional. When a labelled set is supplied, /eval exposes the
+    full evaluation over the repo being served.
     """
     from fastapi import FastAPI, HTTPException, Query
     from pydantic import BaseModel, Field
@@ -596,12 +665,23 @@ def create_app(repo: Path):
     class Health(BaseModel):
         status: str = Field(examples=["ok"])
         repo: str
+        repo_name: str = Field(
+            examples=["fastapi"],
+            description="Just the directory name -- what a UI should display, "
+                        "so a screenshot does not publish someone's home path.")
+        has_eval: bool = Field(
+            description="Whether a labelled question set was supplied, and so "
+                        "whether /eval will answer.")
         chunks: int = Field(examples=[45])
         sample_symbols: list[str] = Field(
             description="Real symbol names from this index, so a UI can offer "
                         "identifier-query examples that actually resolve.")
 
     class Hit(BaseModel):
+        chunk_id: str = Field(
+            examples=["app/anomaly.py:34-85"],
+            description="Stable across retrievers, so a client can tell when two "
+                        "of them returned the same chunk.")
         path: str = Field(examples=["app/anomaly.py"])
         start_line: int = Field(examples=[34])
         end_line: int = Field(examples=[85])
@@ -609,6 +689,39 @@ def create_app(repo: Path):
         kind: str = Field(examples=["function"], description="function, class or module")
         score: float = Field(examples=[11.56])
         source: str
+        terms: list[dict] | None = Field(
+            default=None,
+            description="For BM25 hits only: what each query term contributed "
+                        "to the score, and whether NAME_BOOST fired. Cosine "
+                        "similarity has no equivalent decomposition, so vector "
+                        "hits carry null -- which is itself worth seeing.")
+        name_boost: float | None = Field(
+            default=None,
+            description="The multiplier applied because a query token exactly "
+                        "matched this chunk's name, or null if it did not fire.")
+
+    class Ranking(BaseModel):
+        retriever: str = Field(examples=["bm25"])
+        took_ms: float = Field(examples=[2.3])
+        results: list[Hit]
+
+    class CompareResponse(BaseModel):
+        query: str
+        query_kind: str
+        routed_to: str = Field(
+            description="The retriever the router picked -- the one the project "
+                        "argues you should use for this query.")
+        rankings: list[Ranking] = Field(
+            description="bm25, vector and their unweighted RRF fusion, over the "
+                        "same query, so the three can be read against each other.")
+
+    class ChunkRef(BaseModel):
+        chunk_id: str
+        path: str
+        name: str
+        start_line: int
+        end_line: int
+        kind: str
 
     class SearchResponse(BaseModel):
         query: str
@@ -649,9 +762,14 @@ def create_app(repo: Path):
         ),
     )
 
-    def _serialise(hits):
-        return [
-            {
+    index_of = {c["chunk_id"]: i for i, c in enumerate(chunks)}
+
+    def _serialise(hits, query=None):
+        """`query` is passed only for BM25 rankings, which can be itemised."""
+        out = []
+        for score, c in hits:
+            row = {
+                "chunk_id": c["chunk_id"],
                 "path": c["path"],
                 "start_line": c["start_line"],
                 "end_line": c["end_line"],
@@ -659,9 +777,14 @@ def create_app(repo: Path):
                 "kind": c["kind"],
                 "score": round(score, 4),
                 "source": c["source"],
+                "terms": None,
             }
-            for score, c in hits
-        ]
+            if query is not None:
+                e = bm.explain(query, index_of[c["chunk_id"]])
+                row["terms"] = e["terms"]
+                row["name_boost"] = e["name_boost"]
+            out.append(row)
+        return out
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -709,6 +832,8 @@ def create_app(repo: Path):
         return {
             "status": "ok",
             "repo": str(repo),
+            "repo_name": repo.resolve().name,
+            "has_eval": questions is not None,
             "chunks": len(chunks),
             "sample_symbols": samples,
         }
@@ -725,8 +850,76 @@ def create_app(repo: Path):
             "query_kind": kind,
             "retriever": "bm25" if kind == "identifier" else "vector",
             "took_ms": round(took, 2),
-            "results": _serialise(hits),
+            "results": _serialise(hits, q if kind == "identifier" else None),
         }
+
+    @app.get("/compare", response_model=CompareResponse,
+             summary="Run both retrievers and their fusion on one query")
+    def compare(q: str = Query(..., min_length=1), k: int = Query(5, ge=1, le=20)):
+        """The evaluation, one query at a time.
+
+        Returns all three rankings rather than the routed one, so a client can
+        show what the aggregate numbers in the README mean on a single query:
+        where each retriever puts the right chunk, and what unweighted RRF does
+        to that when it gives both an equal vote.
+        """
+        t0 = time.perf_counter()
+        keyword = bm.search(q, k=FUSE_DEPTH)
+        t_bm = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        dense = vec.search(q, k=FUSE_DEPTH)
+        t_vec = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        fused = rrf([keyword, dense], top=k)
+        t_rrf = (time.perf_counter() - t0) * 1000
+
+        kind = "identifier" if is_identifier_query(q, names) else "paraphrase"
+        return {
+            "query": q,
+            "query_kind": kind,
+            "routed_to": "bm25" if kind == "identifier" else "vector",
+            "rankings": [
+                {"retriever": "bm25", "took_ms": round(t_bm, 2),
+                 "results": _serialise(keyword[:k], q)},
+                {"retriever": "vector", "took_ms": round(t_vec, 2),
+                 "results": _serialise(dense[:k])},
+                {"retriever": "rrf", "took_ms": round(t_rrf, 2),
+                 "results": _serialise(fused)},
+            ],
+        }
+
+    _eval_cache: dict = {}
+
+    @app.get("/eval", summary="The full evaluation over the repo being served")
+    def eval_endpoint():
+        """Aggregates plus the per-question ranks behind them.
+
+        Computed once and held, because the index is immutable for the process
+        lifetime, so the answer cannot change between requests. Returns 404
+        rather than an empty table when no labelled questions were supplied --
+        a question set belongs to a specific repo, and silently evaluating one
+        repo's questions against another's code would produce numbers that look
+        real and mean nothing.
+        """
+        if questions is None:
+            raise HTTPException(
+                404, "No question set loaded. Start with: "
+                     "python arch.py serve <repo> <questions.json>")
+        if "report" not in _eval_cache:
+            _eval_cache["report"] = run_eval(chunks, questions, bm=bm, vec=vec)
+        return _eval_cache["report"]
+
+    @app.get("/chunks", response_model=list[ChunkRef],
+             summary="Every chunk in the index, without its source")
+    def chunk_list():
+        return [
+            {"chunk_id": c["chunk_id"], "path": c["path"], "name": c["name"],
+             "start_line": c["start_line"], "end_line": c["end_line"],
+             "kind": c["kind"]}
+            for c in chunks
+        ]
 
     @app.get("/ask", response_model=AskResponse,
              summary="Answer a question with citations")
@@ -834,9 +1027,14 @@ def main(argv: list[str]) -> None:
         import uvicorn
 
         port = int(os.environ.get("PORT", "8000"))
+        qs = None
+        if len(argv) > 2:
+            qs = load_questions(Path(argv[2]).expanduser())
         print(f"indexed {len(chunks)} chunks from {root}")
-        print(f"http://127.0.0.1:{port}/docs")
-        uvicorn.run(create_app(root), host="127.0.0.1", port=port)
+        if qs:
+            print(f"loaded {len(qs)} labelled questions -- /eval is live")
+        print(f"http://127.0.0.1:{port}")
+        uvicorn.run(create_app(root, qs), host="127.0.0.1", port=port)
 
     elif command == "eval":
         if not argv[2:]:

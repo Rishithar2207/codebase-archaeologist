@@ -88,7 +88,9 @@ model entirely.
 | `python arch.py route <repo> <query>` | routed retrieval (the recommended path) |
 | `python arch.py ask <repo> <query>` | routed retrieval → Gemini → cited answer |
 | `python arch.py eval <repo> <questions.json>` | the full evaluation |
-| `python arch.py serve <repo>` | FastAPI on :8000, web UI at / and docs at /docs |
+| `python arch.py serve <repo> [questions.json]` | FastAPI on :8000, web UI at / and docs at /docs |
+
+Passing the question set to `serve` turns on the evaluation view in the browser.
 
 ### The web UI
 
@@ -98,16 +100,51 @@ names the token it matched; typing "how does it encode json" turns it green and 
 symbol was named. Classification is its own endpoint — it runs the router and nothing
 else, so it costs a regex and a set lookup per keystroke, with no retrieval and no model.
 
-Results show their raw retrieval score and a bar scaled to the top hit, which makes
-finding 3 below visible rather than described: `jsonable_encoder` against FastAPI scores
-the definition at **51.5** and the next hit at **16.6**, returned in **3ms**.
+Every BM25 result is shown **with its arithmetic**: each query term's contribution,
+its term frequency and idf, and whether `NAME_BOOST` fired. Querying `jsonable_encoder`
+against FastAPI, the definition scores 51.5 and the runner-up 16.6, and the breakdown
+says exactly why — `tf 35` against `tf 1`, times a boost the other chunk does not get.
+The matched terms are highlighted in the source. Vector hits show no such breakdown,
+because cosine similarity does not have one; the UI says so rather than inventing an
+explanation, and that asymmetry is a fair summary of the trade between the two.
+
+The itemisation is a second implementation of the BM25 formula rather than a refactor
+of the scoring loop — building a per-term dict for all 557 chunks would cost more than
+the retrieval it describes. A test asserts the two agree for every chunk over several
+queries, which is what stops them drifting apart.
+
+**Compare mode** is the argument of this README, run live on one query. It puts BM25,
+the vector index and their RRF fusion side by side over the same input, marks the
+column the router would have picked, and then states where fusion's top result came
+from — typically something one retriever ranked 4th and the other never returned at
+all, now sitting above a chunk the right retriever had at rank 1. The aggregate table
+above says fusion loses; this shows the single-query mechanism by which it loses.
+
+**The evaluation view** is the table at the top of this README, live, with the
+per-question ranks underneath it. Every labelled question is a row showing where each
+of the four retrievers put the expected chunk — 1, a worse rank, or a dash for a miss.
+Filter to the unanswered ones to see the ceiling directly. Clicking any row loads that
+question into compare mode, so an aggregate you distrust is two clicks from the
+retrieval that produced it.
+
+Below everything, a grid of one square per chunk in the index shows which 5 of the
+several hundred were retrieved, coloured by which retriever found them. Hovering a
+square names its chunk, highlights it in the results and lights up the rest of its
+file; hovering a result finds its square. It makes the selectivity of retrieval
+obvious in a way a list of five filenames does not.
+
+`/` focuses the query box, `Esc` clears it, and the URL carries the query and mode —
+so a specific demo can be linked rather than described.
 
 | | |
 |---|---|
 | `GET /` | the page |
 | `GET /classify?q=` | which retriever would take this query, and why |
-| `GET /search?q=&k=` | retrieved chunks with scores |
+| `GET /search?q=&k=` | retrieved chunks, with per-term scoring for BM25 |
+| `GET /compare?q=&k=` | all three rankings over one query |
 | `GET /ask?q=&k=` | cited answer |
+| `GET /eval` | the full evaluation, aggregates and per-question ranks |
+| `GET /chunks` | every chunk in the index, without its source |
 | `GET /health` | chunk count and sample symbols from the index |
 | `/docs` | Swagger |
 
@@ -244,10 +281,17 @@ expected chunk was retrieved. It never measured whether the answer was good.
 pytest -q
 ```
 
-29 tests, no network and no model. They cover the parts that can be wrong in ways a
+34 tests, no network and no model. They cover the parts that can be wrong in ways a
 human wouldn't notice: tokenisation, chunk boundaries, fusion arithmetic, metric
-definitions, routing. The embedding model is a dependency, not this project's code —
-what's tested is how its output is combined.
+definitions, routing, and the evaluation harness itself. The embedding model is a
+dependency, not this project's code — what's tested is how its output is combined.
+
+The test that earns its place most is `test_explain_sums_to_the_score_it_claims_to_
+explain`. The UI shows a per-term breakdown of every BM25 score, computed by a
+different code path from the scoring loop for performance reasons. An explanation that
+quietly stops matching the thing it explains is worse than no explanation, so the test
+walks every chunk over several queries and asserts the itemised contributions still
+multiply out to the score actually used for ranking.
 
 ---
 
